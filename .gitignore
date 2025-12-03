@@ -38,3 +38,10 @@ prepare_data
 
 !example/audio.wav
 !example/image.png
+
+# 我的个性化配置
+outputs/
+*.log
+*.tmp
+out/
+21_kp_csv/

@@ -87,3 +87,11 @@ python single_frame_perturb.py \
   --output_dir ./outputs/perturb_test
   （执行63维的所有扰动）
 
+python single_frame_perturb.py \
+  --image ./example/image.png \
+  --cfg_pkl ./checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl \
+  --data_root ./checkpoints/ditto_trt_Ampere_Plus \
+  --dimension 5 \
+  --delta -0.05 \
+  --output_dir ./outputs/perturb_test_single
+
