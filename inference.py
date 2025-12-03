@@ -72,11 +72,18 @@ if __name__ == "__main__":
     parser.add_argument("--audio_path", type=str, help="path to input wav")
     parser.add_argument("--source_path", type=str, help="path to input image")
     parser.add_argument("--output_path", type=str, help="path to output mp4")
+    parser.add_argument("--compare_gaze", action="store_true", help="生成有/无 gaze control 的对比输出")
+    parser.add_argument("--gaze_amp_yaw", type=float, default=15.0, help="头部 yaw 振幅 (度)，用以制造明显头部运动以便比较")
+    parser.add_argument("--gaze_amp_pitch", type=float, default=5.0, help="头部 pitch 振幅 (度)")
+    parser.add_argument("--gaze_freq", type=float, default=0.4, help="头部运动频率 (Hz)")
+    parser.add_argument("--gaze_comp_sign", type=float, default=1.0, help="gaze 补偿符号，设置为 -1 或 1 来翻转补偿方向")
+    parser.add_argument("--dump_kp_dir", type=str, default=None, help="(optional) directory to dump per-frame kp_info NPZ files")
     args = parser.parse_args()
 
     # init sdk
     data_root = args.data_root   # model dir
     cfg_pkl = args.cfg_pkl     # cfg pkl
+    # Note: when comparing gaze we will create separate SDK instances per run
     SDK = StreamSDK(cfg_pkl, data_root)
 
     # input args
@@ -86,4 +93,45 @@ if __name__ == "__main__":
 
     # run
     # seed_everything(1024)
-    run(SDK, audio_path, source_path, output_path)
+    if not args.compare_gaze:
+        more_kwargs = {}
+        if args.dump_kp_dir:
+            more_kwargs = {"setup_kwargs": {"dump_kp_dir": args.dump_kp_dir}}
+        run(SDK, audio_path, source_path, output_path, more_kwargs)
+    else:
+        # load audio to compute frame count (same logic as in run)
+        audio, sr = librosa.core.load(audio_path, sr=16000)
+        num_f = math.ceil(len(audio) / 16000 * 25)
+
+        # build head motion ctrl_info: per-frame sinusoidal yaw/pitch offsets in degrees
+        amp_yaw = args.gaze_amp_yaw  # degrees
+        amp_pitch = args.gaze_amp_pitch  # degrees
+        freq = args.gaze_freq
+        ctrl_info = {}
+        for i in range(num_f):
+            t = i / 25.0
+            yaw = amp_yaw * math.sin(2 * math.pi * freq * t)
+            pitch = amp_pitch * math.sin(2 * math.pi * freq * t + math.pi / 6)
+            ctrl_info[i] = {"delta_yaw": float(yaw), "delta_pitch": float(pitch)}
+
+        # no-gaze output
+        out_nogaze = os.path.splitext(args.output_path)[0] + "_no_gaze.mp4"
+        SDK1 = StreamSDK(cfg_pkl, data_root)
+        more_kwargs_nogaze = {
+            "setup_kwargs": {"overall_ctrl_info": {"gaze_fixed": False, "gaze_comp_sign": args.gaze_comp_sign}},
+            "run_kwargs": {"ctrl_info": ctrl_info}
+        }
+        if args.dump_kp_dir:
+            more_kwargs_nogaze.setdefault('setup_kwargs', {})['dump_kp_dir'] = os.path.join(args.dump_kp_dir, 'nogaze')
+        run(SDK1, audio_path, source_path, out_nogaze, more_kwargs_nogaze)
+
+        # gaze output
+        out_gaze = os.path.splitext(args.output_path)[0] + "_gaze.mp4"
+        SDK2 = StreamSDK(cfg_pkl, data_root)
+        more_kwargs_gaze = {
+            "setup_kwargs": {"overall_ctrl_info": {"gaze_fixed": True, "gaze_comp_sign": args.gaze_comp_sign}},
+            "run_kwargs": {"ctrl_info": ctrl_info}
+        }
+        if args.dump_kp_dir:
+            more_kwargs_gaze.setdefault('setup_kwargs', {})['dump_kp_dir'] = os.path.join(args.dump_kp_dir, 'gaze')
+        run(SDK2, audio_path, source_path, out_gaze, more_kwargs_gaze)

@@ -38,11 +38,22 @@ def ctrl_motion(x_d_info, **kwargs):
             k = kk[6:]
             x_d_info[k] = x_d_info[k] * kwargs[kk]
 
-    # exp + offset
+    # exp + offset (新增：支持delta_exp)
     if "delta_exp" in kwargs:
-        k = "exp"
-        x_d_info[k] = x_d_info[k] + kwargs["delta_exp"]
-
+        delta_exp = kwargs["delta_exp"]
+        # 确保形状匹配
+        if delta_exp.shape != x_d_info['exp'].shape:
+            # 尝试重塑
+            if delta_exp.size == 63:
+                delta_exp = delta_exp.reshape(1, 21, 3)
+            elif delta_exp.ndim == 2 and delta_exp.shape[1] == 63:
+                delta_exp = delta_exp.reshape(1, 21, 3)
+        
+        if delta_exp.shape == x_d_info['exp'].shape:
+            x_d_info['exp'] = x_d_info['exp'] + delta_exp
+        else:
+            print(f"警告: delta_exp形状不匹配: {delta_exp.shape} vs {x_d_info['exp'].shape}")
+    
     return x_d_info
 
 
@@ -187,10 +198,23 @@ def _eye_delta(exp, dx=0, dy=0):
     exp[0, 46] += dy * -0.001
     return exp
 
-def _fix_gaze(pose_s, x_d_info):
+def _fix_gaze(pose_s, x_d_info, kwargs=None):
+    """
+    Adjust eye expression to account for difference between source pose and
+    destination pose. If `gaze_fixed` is True in kwargs, apply inverse
+    compensation so the eyes remain looking toward the camera when the head
+    moves (i.e. eyes counter-rotate relative to head pose).
+    """
     x_ratio = 0.26
     y_ratio = 0.28
-    
+
+    gaze_fixed = False
+    gaze_comp_sign = 1.0
+    if kwargs is not None:
+        gaze_fixed = kwargs.get("gaze_fixed", False)
+        # user-controllable sign to flip compensation direction if needed
+        gaze_comp_sign = float(kwargs.get("gaze_comp_sign", 1.0))
+
     yaw_s, pitch_s = pose_s
     yaw_d = bin66_to_degree(x_d_info['yaw']).item()
     pitch_d = bin66_to_degree(x_d_info['pitch']).item()
@@ -198,9 +222,13 @@ def _fix_gaze(pose_s, x_d_info):
     delta_yaw = yaw_d - yaw_s
     delta_pitch = pitch_d - pitch_s
 
-    dx = delta_yaw * x_ratio
-    dy = delta_pitch * y_ratio
-    
+    # when gaze_fixed True, apply inverse compensation so eyes counter-rotate
+    # multiply by gaze_comp_sign to allow scaling/flipping if needed
+    sign = ((-1.0 if gaze_fixed else 1.0) * gaze_comp_sign)
+
+    dx = sign * delta_yaw * x_ratio
+    dy = sign * delta_pitch * y_ratio
+
     x_d_info['exp'] = _eye_delta(x_d_info['exp'], dx, dy)
     return x_d_info
 
@@ -472,7 +500,7 @@ class MotionStitch:
                 yaw_s = bin66_to_degree(x_s_info['yaw']).item()
                 pitch_s = bin66_to_degree(x_s_info['pitch']).item()
                 self.pose_s = [yaw_s, pitch_s]
-            x_d_info = _fix_gaze(self.pose_s, x_d_info)
+            x_d_info = _fix_gaze(self.pose_s, x_d_info, kwargs)
 
         if self.x_s is not None:
             x_s = self.x_s

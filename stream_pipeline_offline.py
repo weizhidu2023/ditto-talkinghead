@@ -2,6 +2,7 @@ import threading
 import queue
 import numpy as np
 import traceback
+import os
 from tqdm import tqdm
 
 from core.atomic_components.avatar_registrar import AvatarRegistrar, smooth_x_s_info_lst
@@ -194,6 +195,12 @@ class StreamSDK:
             overall_ctrl_info=self.overall_ctrl_info,
         )
 
+        # optional: directory to dump per-frame keypoint info (npz)
+        self.dump_kp_dir = kwargs.get("dump_kp_dir", None)
+        if self.dump_kp_dir:
+            import os
+            os.makedirs(self.dump_kp_dir, exist_ok=True)
+
         # ======== Video Writer ========
         self.output_path = output_path
         self.tmp_output_path = output_path + ".tmp.mp4"
@@ -349,6 +356,23 @@ class StreamSDK:
             
             frame_idx, x_d_info, ctrl_kwargs = item
             x_s_info = self.source_info["x_s_info_lst"][frame_idx]
+
+            # optional: dump x_s_info and x_d_info for debugging/analysis
+            try:
+                if getattr(self, 'dump_kp_dir', None):
+                    import numpy as _np
+                    # prepare a lightweight dict to save
+                    kp_pair = {'x_s_info': x_s_info, 'x_d_info': x_d_info}
+                    # filename by frame index
+                    fname = f"frame_{frame_idx:06d}_kpinfo.npz"
+                    # save as object (allow pickle on load)
+                    dst = os.path.join(self.dump_kp_dir, fname)
+                    _np.savez_compressed(dst, kp_info=_np.array(kp_pair, dtype=object))
+            except Exception:
+                # don't block processing if dump fails
+                import traceback
+                traceback.print_exc()
+
             x_s, x_d = self.motion_stitch(x_s_info, x_d_info, **ctrl_kwargs)
             self.warp_f3d_queue.put([frame_idx, x_s, x_d])
 
