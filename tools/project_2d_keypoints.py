@@ -15,88 +15,163 @@ def load_kp_info(npz_path):
     return kp_info['x_s_info']
 
 def calculate_3d_keypoints(kp_info):
-    """计算3D关键点位置（kp + exp）"""
-    kp = kp_info['kp'].flatten()  # (63,)
-    exp = kp_info['exp'].flatten()  # (63,)
-    
-    # 简单相加
-    combined = kp + exp
-    
-    # 重塑为 (21, 3)
-    kp_3d = combined.reshape(21, 3)
-    
-    # 获取姿态信息（用于调整）
-    pitch = kp_info['pitch']
-    yaw = kp_info['yaw']
-    roll = kp_info['roll']
-    
-    # 简单计算主要姿态角度
+    """计算3D关键点位置，基于 LivePortrait 的变换：s * (R * kp + exp) + t
+
+    兼容多种输入形状：flat、(N,3)、(bs,N,3)。如果 exp 是 63-D 表情向量，尝试 reshape 为 (21,3)。
+    返回: kp_3d (N,3) 以及 pose angles (pitch,yaw,roll)（以度为单位）
+    """
+    def _to_batch_kp(a):
+        a = np.asarray(a)
+        if a.ndim == 1:
+            return a.reshape(1, a.size // 3, 3)
+        if a.ndim == 2:
+            if a.shape[1] == 3:
+                return a[np.newaxis, ...]
+            if a.shape[1] % 3 == 0:
+                return a.reshape(a.shape[0], a.shape[1] // 3, 3)
+            return a.reshape(1, a.size // 3, 3)
+        return a
+
+    def _rotation_matrices_from_degrees(pitch, yaw, roll):
+        p = np.radians(np.asarray(pitch).reshape(-1))
+        y = np.radians(np.asarray(yaw).reshape(-1))
+        r = np.radians(np.asarray(roll).reshape(-1))
+        bs = max(len(p), 1)
+        mats = np.zeros((bs, 3, 3), dtype=float)
+        for i in range(bs):
+            cp, sp = np.cos(p[i]), np.sin(p[i])
+            cy, sy = np.cos(y[i]), np.sin(y[i])
+            cr, sr = np.cos(r[i]), np.sin(r[i])
+            Rx = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
+            Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+            Rz = np.array([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]])
+            mats[i] = Rz @ Ry @ Rx
+        return mats
+
+    kp = kp_info['kp']
+    exp = kp_info['exp']
+
+    kp_b = _to_batch_kp(kp)
+    try:
+        exp_b = _to_batch_kp(exp)
+    except Exception:
+        exp_arr = np.asarray(exp)
+        if exp_arr.size == 63:
+            exp_b = exp_arr.reshape(1, 21, 3)
+        else:
+            exp_b = np.zeros_like(kp_b)
+
+    # broadcast batch if needed
+    if exp_b.shape[0] != kp_b.shape[0]:
+        exp_b = np.repeat(exp_b, kp_b.shape[0], axis=0)
+
+    # adjust keypoint count
+    if exp_b.shape[1] != kp_b.shape[1]:
+        n = min(exp_b.shape[1], kp_b.shape[1])
+        exp_b = exp_b[:, :n, :]
+        kp_b = kp_b[:, :n, :]
+
+    pitch = kp_info.get('pitch', None)
+    yaw = kp_info.get('yaw', None)
+    roll = kp_info.get('roll', None)
+    t = kp_info.get('t', None)
+    scale = kp_info.get('scale', None)
+
+    # compute pose angles for return
     def get_angle_from_distribution(dist):
-        """从66-bin分布获取角度"""
         bins = np.linspace(-99, 99, 66)
         max_bin = np.argmax(dist)
         return bins[max_bin]
-    
-    pitch_angle = get_angle_from_distribution(pitch.flatten())
-    yaw_angle = get_angle_from_distribution(yaw.flatten())
-    roll_angle = get_angle_from_distribution(roll.flatten())
-    
-    print(f"Pose angles: pitch={pitch_angle:.1f}°, yaw={yaw_angle:.1f}°, roll={roll_angle:.1f}°")
-    
-    return kp_3d, (pitch_angle, yaw_angle, roll_angle)
+
+    if hasattr(pitch, 'flatten') and hasattr(yaw, 'flatten') and hasattr(roll, 'flatten'):
+        try:
+            pitch_angle = get_angle_from_distribution(np.asarray(pitch).flatten())
+            yaw_angle = get_angle_from_distribution(np.asarray(yaw).flatten())
+            roll_angle = get_angle_from_distribution(np.asarray(roll).flatten())
+        except Exception:
+            pitch_angle = yaw_angle = roll_angle = 0.0
+    else:
+        pitch_angle = yaw_angle = roll_angle = 0.0
+
+    rot_mats = _rotation_matrices_from_degrees(pitch_angle, yaw_angle, roll_angle)
+
+    kp_rot = np.einsum('bnc,bcd->bnd', kp_b, rot_mats)
+    kp_transformed = kp_rot + exp_b
+
+    if scale is not None:
+        try:
+            s = float(np.asarray(scale).reshape(-1)[0])
+            kp_transformed = kp_transformed * s
+        except Exception:
+            pass
+
+    if t is not None:
+        t_arr = np.asarray(t)
+        if t_arr.size >= 2:
+            kp_transformed[:, :, 0:2] += t_arr.reshape(1, -1)[:, None, 0:2]
+
+    # return first batch if single
+    if kp_transformed.shape[0] == 1:
+        return kp_transformed[0], (pitch_angle, yaw_angle, roll_angle)
+    return kp_transformed, (pitch_angle, yaw_angle, roll_angle)
 
 def project_3d_to_2d(kp_3d, image_shape, pose_angles=None):
     """
     将3D关键点投影到2D图像平面
     """
     h, w = image_shape[:2]
-    
-    # 1. 归一化关键点（使其在合理范围内）
-    # 先找到边界
-    x_min, x_max = kp_3d[:, 0].min(), kp_3d[:, 0].max()
-    y_min, y_max = kp_3d[:, 1].min(), kp_3d[:, 1].max()
-    z_min, z_max = kp_3d[:, 2].min(), kp_3d[:, 2].max()
-    
-    print(f"3D bounds: X[{x_min:.3f}, {x_max:.3f}], Y[{y_min:.3f}, {y_max:.3f}], Z[{z_min:.3f}, {z_max:.3f}]")
-    
-    # 2. 创建简单的投影矩阵（正交投影）
-    # 将3D点投影到2D，考虑简单的面部几何
-    kp_2d = np.zeros((len(kp_3d), 2))
-    
-    # 方法A：简单正交投影（忽略z）
+
+    # 先把 kp_3d 转为 numpy array 确保可操作
+    pts = np.asarray(kp_3d)
+    # 打印3D边界信息
+    x_min, x_max = pts[:, 0].min(), pts[:, 0].max()
+    y_min, y_max = pts[:, 1].min(), pts[:, 1].max()
+    z_min, z_max = pts[:, 2].min(), pts[:, 2].max()
+    print(f"3D bounds: X[{x_min:.3f}, {x_max:.3f}], Y[{y_min:.3f}, {y_max:.3f}], Z[{z_min:.3f}]")
+
+    # 如果提供姿态角则应用旋转（向量化），否则直接使用原坐标
     if pose_angles is None:
-        # 居中并缩放
-        kp_2d[:, 0] = (kp_3d[:, 0] - x_min) / (x_max - x_min) * w * 0.6 + w * 0.2
-        kp_2d[:, 1] = (kp_3d[:, 1] - y_min) / (y_max - y_min) * h * 0.6 + h * 0.2
+        x_final = pts[:, 0].copy()
+        y_final = pts[:, 1].copy()
     else:
-        # 方法B：考虑姿态的简单投影
         pitch, yaw, roll = pose_angles
-        
-        # 将角度转换为弧度
         pitch_rad = np.radians(pitch)
         yaw_rad = np.radians(yaw)
         roll_rad = np.radians(roll)
-        
-        # 简单的旋转矩阵（仅用于演示）
-        # 实际上应该使用论文中的变换，但这里简化处理
-        for i in range(len(kp_3d)):
-            x, y, z = kp_3d[i]
-            
-            # 应用yaw旋转（左右转头）
-            x_rot = x * np.cos(yaw_rad) - z * np.sin(yaw_rad)
-            z_rot = x * np.sin(yaw_rad) + z * np.cos(yaw_rad)
-            
-            # 应用pitch旋转（上下点头）
-            y_rot = y * np.cos(pitch_rad) - z_rot * np.sin(pitch_rad)
-            z_final = y * np.sin(pitch_rad) + z_rot * np.cos(pitch_rad)
-            
-            # 投影到2D（正交投影）
-            # 考虑面部特征：眼睛应该在图像上半部分，嘴巴在下半部分
-            screen_x = (x_rot + 0.5) * w  # 假设x在[-0.5, 0.5]范围内
-            screen_y = (0.5 - y_rot) * h  # 反转y轴
-            
-            kp_2d[i] = [screen_x, screen_y]
-    
+
+        x = pts[:, 0]
+        y = pts[:, 1]
+        z = pts[:, 2]
+
+        # yaw around Y axis (左右)
+        x_rot = x * np.cos(yaw_rad) - z * np.sin(yaw_rad)
+        z_rot = x * np.sin(yaw_rad) + z * np.cos(yaw_rad)
+
+        # pitch around X axis (上下)
+        y_rot = y * np.cos(pitch_rad) - z_rot * np.sin(pitch_rad)
+        # z_final = y * np.sin(pitch_rad) + z_rot * np.cos(pitch_rad)
+
+        # apply roll as in-plane rotation
+        x_final = x_rot * np.cos(roll_rad) - y_rot * np.sin(roll_rad)
+        y_final = x_rot * np.sin(roll_rad) + y_rot * np.cos(roll_rad)
+
+    # 中心化并按范围自适应缩放，使关键点群居中且落在面部区域
+    cx = x_final.mean()
+    cy = y_final.mean()
+
+    rx = x_final.max() - x_final.min()
+    ry = y_final.max() - y_final.min()
+    # 防止除零
+    rx = max(rx, 1e-6)
+    ry = max(ry, 1e-6)
+
+    # 使用图像较小边的比例来决定缩放，保证不会超出图像
+    scale = min(w, h) * 0.4 / max(rx, ry)
+
+    screen_x = (w / 2.0) + (x_final - cx) * scale
+    screen_y = (h / 2.0) + (y_final - cy) * scale  # 图像 y 向下为正，所以减号将 3D 向上映射到图像向上？
+
+    kp_2d = np.stack([screen_x, screen_y], axis=1)
     return kp_2d
 
 def visualize_on_image(image_path, kp_2d, save_path, title="2D Keypoints Projection"):
@@ -361,7 +436,8 @@ def create_alignment_grid(image_path, kp_2d, save_dir):
         ax = axes[idx]
         ax.imshow(image_rgb)
         
-        if specific_indices is False:
+        # specific_indices can be False (use all), True (use all), a list of indices, or False
+        if specific_indices is False or specific_indices is True:
             # 使用所有点
             indices = range(len(kp_2d))
         else:
@@ -382,8 +458,14 @@ def create_alignment_grid(image_path, kp_2d, save_dir):
                 # 使用索引作为值
                 values = list(range(len(indices)))
             
-            norm = plt.Normalize(values.min(), values.max())
-            cmap_func = plt.cm.get_cmap(cmap)
+            values = np.asarray(values)
+            vmin, vmax = float(values.min()), float(values.max())
+            if vmin == vmax:
+                # avoid zero-range Normalize
+                vmin -= 1e-6
+                vmax += 1e-6
+            norm = plt.Normalize(vmin, vmax)
+            cmap_func = plt.get_cmap(cmap)
             colors = cmap_func(norm(values))
         else:
             colors = plt.cm.get_cmap(cmap)(np.arange(len(indices)) / max(1, len(indices)-1))

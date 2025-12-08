@@ -47,7 +47,10 @@ def extract_kp_and_exp(kp_info):
     # 方法1：直接查找
     if 'kp' in kp_info and 'exp' in kp_info:
         print("  Found kp and exp directly")
-        return kp_info['kp'], kp_info['exp']
+        kp = kp_info['kp']
+        exp = kp_info['exp']
+        extra = {k: kp_info.get(k, None) for k in ('pitch', 'yaw', 'roll', 't', 'scale')}
+        return kp, exp, extra
     
     # 方法2：检查常见的关键名称
     key_mapping = {
@@ -115,42 +118,167 @@ def extract_kp_and_exp(kp_info):
                 exp = combined.reshape(1, -1)
                 kp = np.zeros_like(exp)
                 print(f"   Assuming exp only, shape: {exp.shape}")
-    
-    return kp, exp
+    extra = {k: kp_info.get(k, None) for k in ('pitch', 'yaw', 'roll', 't', 'scale')}
+    return kp, exp, extra
 
-def transform_keypoints_simple(kp, exp):
-    """简化版的3D关键点计算（kp + exp）"""
-    print("\n🧮 Calculating 3D positions (kp + exp)...")
-    
-    # 确保形状一致
-    kp_flat = kp.flatten()
-    exp_flat = exp.flatten()
-    
-    print(f"  kp flattened length: {len(kp_flat)}")
-    print(f"  exp flattened length: {len(exp_flat)}")
-    
-    if len(kp_flat) != len(exp_flat):
-        print(f"  ⚠️  Length mismatch, truncating to min length")
-        min_len = min(len(kp_flat), len(exp_flat))
-        kp_flat = kp_flat[:min_len]
-        exp_flat = exp_flat[:min_len]
-    
-    # 计算3D位置
-    combined = kp_flat + exp_flat
-    
-    # 重塑为 (num_kp, 3)
-    num_kp = len(combined) // 3
-    if len(combined) % 3 != 0:
-        print(f"  ⚠️  Total length {len(combined)} not divisible by 3")
-        # 补齐到最近的3的倍数
-        pad_len = 3 - (len(combined) % 3)
-        combined = np.pad(combined, (0, pad_len), 'constant')
-        num_kp = len(combined) // 3
-    
-    kp_3d = combined.reshape(num_kp, 3)
-    print(f"  Reshaped to: {kp_3d.shape} ({num_kp} keypoints)")
-    
-    return kp_3d
+def _to_batch_kp(a):
+    a = np.asarray(a)
+    if a.ndim == 1:
+        if a.size % 3 != 0:
+            raise ValueError('Flat keypoint array length is not divisible by 3')
+        return a.reshape(1, a.size // 3, 3)
+    if a.ndim == 2:
+        # cases: (N,3) -> treat as (1,N,3); (bs, N*3) -> reshape to (bs, N,3)
+        if a.shape[1] == 3:
+            return a[np.newaxis, ...]
+        if a.shape[1] % 3 == 0:
+            return a.reshape(a.shape[0], a.shape[1] // 3, 3)
+        # fallback: flatten and try
+        if a.size % 3 == 0:
+            return a.reshape(1, a.size // 3, 3)
+    if a.ndim == 3:
+        return a
+    raise ValueError('Unsupported keypoint array shape: ' + str(a.shape))
+
+
+def _rotation_matrices_from_degrees(pitch, yaw, roll):
+    """输入角度（deg）标量或数组（bs,），返回 (bs,3,3) 旋转矩阵。顺序: R = Rz(roll) @ Ry(yaw) @ Rx(pitch)"""
+    pitch = np.asarray(pitch) if pitch is not None else None
+    yaw = np.asarray(yaw) if yaw is not None else None
+    roll = np.asarray(roll) if roll is not None else None
+
+    # Determine batch size
+    bs = 1
+    for arr in (pitch, yaw, roll):
+        if arr is not None:
+            if arr.ndim == 0:
+                bs = max(bs, 1)
+            else:
+                bs = max(bs, arr.shape[0])
+
+    def to_arr(x):
+        if x is None:
+            return np.zeros((bs,))
+        xa = np.asarray(x).reshape(-1)
+        if xa.shape[0] == 1 and bs > 1:
+            return np.repeat(xa, bs)
+        return xa
+
+    p = np.radians(to_arr(pitch))
+    y = np.radians(to_arr(yaw))
+    r = np.radians(to_arr(roll))
+
+    mats = np.zeros((bs, 3, 3), dtype=float)
+    for i in range(bs):
+        cp, sp = np.cos(p[i]), np.sin(p[i])
+        cy, sy = np.cos(y[i]), np.sin(y[i])
+        cr, sr = np.cos(r[i]), np.sin(r[i])
+
+        Rx = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
+        Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+        Rz = np.array([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]])
+
+        mats[i] = Rz @ Ry @ Rx
+
+    return mats
+
+
+def transform_keypoints(kp, exp, extra=None):
+    """基于 LivePortrait 的 Eqn.2: s * (R * x_c + exp) + t
+    kp, exp 可以是多种形状（flat, (N,3), (bs,N,3)），extra 可包含 'pitch','yaw','roll','t','scale'
+    返回形状 (bs, N, 3) 或 (N,3)（如果 bs==1 会 squeeze）
+    """
+    print("\n🧮 Calculating 3D positions using transform (R * kp + exp)...")
+
+    kp_b = _to_batch_kp(kp)
+
+    # Try to interpret exp as per-keypoint displacements
+    try:
+        exp_b = _to_batch_kp(exp)
+    except Exception:
+        exp_arr = np.asarray(exp)
+        if exp_arr.size == 63:
+            try:
+                exp_b = exp_arr.reshape(1, 21, 3)
+                exp_b = np.repeat(exp_b, kp_b.shape[0], axis=0)
+                print("  Note: exp is 63-D, reshaped to (21,3) and broadcasted to batch")
+            except Exception:
+                exp_b = np.zeros_like(kp_b)
+                print("  Warning: cannot reshape 63-D exp to per-keypoint displacements; using zeros")
+        else:
+            exp_b = np.zeros_like(kp_b)
+            print("  Warning: exp not per-keypoint, using zero displacements")
+
+    bs = kp_b.shape[0]
+    num_kp = kp_b.shape[1]
+
+    # If exp has different num_kp, trim or pad
+    if exp_b.shape[1] != num_kp:
+        min_k = min(exp_b.shape[1], num_kp)
+        if exp_b.shape[1] < num_kp:
+            pad = np.zeros((bs, num_kp - exp_b.shape[1], 3), dtype=exp_b.dtype)
+            exp_b = np.concatenate([exp_b, pad], axis=1)
+        else:
+            exp_b = exp_b[:, :num_kp, :]
+        print(f"  Adjusted exp to match keypoint count: {exp_b.shape}")
+
+    # pose info
+    pitch = yaw = roll = None
+    t = None
+    scale = None
+    if extra is not None:
+        pitch = extra.get('pitch', None)
+        yaw = extra.get('yaw', None)
+        roll = extra.get('roll', None)
+        t = extra.get('t', None)
+        scale = extra.get('scale', None)
+
+    # rotation matrices
+    if pitch is None or yaw is None or roll is None:
+        rot_mats = np.repeat(np.eye(3)[None, ...], bs, axis=0)
+        print("  Note: pitch/yaw/roll not provided, using identity rotation")
+    else:
+        rot_mats = _rotation_matrices_from_degrees(pitch, yaw, roll)
+
+    # Apply rotation (kp @ R) and add exp
+    kp_rot = np.einsum('bnc,bcd->bnd', kp_b, rot_mats)
+    kp_transformed = kp_rot + exp_b
+
+    # scale
+    if scale is not None:
+        s = np.asarray(scale).reshape(-1)
+        if s.size == 1:
+            kp_transformed = kp_transformed * s.item()
+        else:
+            kp_transformed = kp_transformed * s[:, None, None]
+
+    # translation (only tx,ty)
+    if t is not None:
+        t_arr = np.asarray(t)
+        if t_arr.ndim == 1 and t_arr.size >= 2:
+            if t_arr.size == 2:
+                t_arr = t_arr.reshape(1, 2)
+            if t_arr.shape[0] == 1 and bs > 1:
+                t_arr = np.repeat(t_arr, bs, axis=0)
+            kp_transformed[:, :, 0:2] += t_arr[:, None, 0:2]
+
+    # Enforce convention: keypoint 1's Y must be positive. If KP1 Y is negative,
+    # flip the Y axis for all keypoints in that batch (handles both bs>1 and bs==1).
+    try:
+        if kp_transformed.ndim == 3:
+            for bi in range(kp_transformed.shape[0]):
+                if kp_transformed[bi, 0, 1] < 0:
+                    kp_transformed[bi, :, 1] = -kp_transformed[bi, :, 1]
+        elif kp_transformed.ndim == 2:
+            if kp_transformed[0, 1] < 0:
+                kp_transformed[:, 1] = -kp_transformed[:, 1]
+    except Exception:
+        # If any unexpected shape issue arises, skip enforcement silently
+        pass
+
+    if kp_transformed.shape[0] == 1:
+        return kp_transformed[0]
+    return kp_transformed
 
 def visualize_3d_keypoints(kp_3d, save_dir='./outputs/visualization'):
     """3D可视化关键点"""
@@ -385,7 +513,7 @@ def main():
     """主函数"""
     # 配置
     npz_path = "./outputs/kp_npz/frame_000000_kpinfo.npz"
-    output_dir = "./outputs/visualization"
+    output_dir = "./outputs/visualization_3d"
     
     print("="*80)
     print("🎭 DITTO 3D KEYPOINT VISUALIZATION TOOL")
@@ -397,15 +525,15 @@ def main():
     # 2. 调试数据结构
     debug_kp_info_structure(kp_info)
     
-    # 3. 提取kp和exp
-    kp, exp = extract_kp_and_exp(kp_info)
+    # 3. 提取kp和exp（以及可能的pose/scale/t）
+    kp, exp, extra = extract_kp_and_exp(kp_info)
     
     # 4. 分析姿态参数
     analyze_pose_parameters(kp_info)
     
     # 5. 计算3D关键点位置
     print("\n🔧 Calculating 3D keypoint positions...")
-    kp_3d = transform_keypoints_simple(kp, exp)
+    kp_3d = transform_keypoints(kp, exp, extra)
     
     # 6. 创建关键点信息表格
     create_keypoint_table(kp_3d)
